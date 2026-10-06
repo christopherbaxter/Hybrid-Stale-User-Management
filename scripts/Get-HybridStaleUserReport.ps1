@@ -1,256 +1,498 @@
-#Requires -Version 5.1
+#requires -Version 5.1
+#requires -Modules ActiveDirectory, Microsoft.Graph.Authentication, Microsoft.Graph.Users
 
 <#
 .SYNOPSIS
-Creates review-only stale-user reports for Active Directory and Microsoft Entra ID.
+Creates a report-first view of potentially stale user accounts across
+Active Directory and Microsoft Entra ID.
 
 .DESCRIPTION
-This script reads users from every domain in the current Active Directory forest,
-optionally enriches them with Microsoft Entra ID sign-in data, applies safety
-checks and exclusions, and exports CSV reports. It does not change any account.
+The script:
+- Reads users from every domain in the current AD forest.
+- Reads users and sign-in activity from Microsoft Entra ID.
+- Correlates records by UserPrincipalName.
+- Reports AD and Entra activity.
+- Reports password age separately from account inactivity.
+- Applies built-in and CSV-based exclusions.
+- Exports a single CSV report.
+- Performs no disablement, deletion, or password reset.
+
+IMPORTANT
+Review every result before taking remediation action.
+Missing activity data is classified as Review, not Stale.
 #>
 
-[CmdletBinding()]
-param(
-    [ValidateRange(1, 3650)]
-    [int]$StaleAfterDays = 90,
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
 
-    [ValidateRange(1, 3650)]
-    [int]$DisabledReviewAfterDays = 90,
+Import-Module ActiveDirectory
+Import-Module Microsoft.Graph.Authentication
+Import-Module Microsoft.Graph.Users
 
-    [string]$OutputPath = (Join-Path -Path $PSScriptRoot -ChildPath '..\output'),
+# ------------------------------------------------------------
+# Configuration
+# ------------------------------------------------------------
 
-    [string]$ExclusionsPath = (Join-Path -Path $PSScriptRoot -ChildPath 'UserExclusions.csv'),
+$StaleDays = 90
+$PasswordReviewDays = 180
 
-    [switch]$SkipMicrosoftGraph
+$OutputFolder = Join-Path $PSScriptRoot "..\output"
+$ExclusionFile = Join-Path $PSScriptRoot "..\examples\UserExclusions.csv"
+$ReportDate = Get-Date -Format "yyyy-MM-dd_HHmmss"
+$ReportPath = Join-Path $OutputFolder "Hybrid-Stale-User-Report-$ReportDate.csv"
+
+$StaleCutoff = (Get-Date).AddDays(-$StaleDays)
+$PasswordCutoff = (Get-Date).AddDays(-$PasswordReviewDays)
+
+# ------------------------------------------------------------
+# Prepare output and exclusions
+# ------------------------------------------------------------
+
+if (-not (Test-Path $OutputFolder)) {
+    New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
+}
+
+$BuiltInNames = @(
+    "Administrator"
+    "Guest"
+    "krbtgt"
+    "DefaultAccount"
+    "WDAGUtilityAccount"
 )
 
-$ErrorActionPreference = 'Stop'
-$RunDate = Get-Date
-$StaleCutoff = $RunDate.Date.AddDays(-$StaleAfterDays)
-$DisabledCutoff = $RunDate.Date.AddDays(-$DisabledReviewAfterDays)
+$CustomExclusions = @()
 
-Import-Module ActiveDirectory -ErrorAction Stop
-New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
-$OutputPath = (Resolve-Path -Path $OutputPath).Path
+if (Test-Path $ExclusionFile) {
+    $CustomExclusions = Import-Csv -Path $ExclusionFile
+}
 
-# Optional exclusions. Required column: SamAccountName.
-$Exclusions = @{}
-if (Test-Path -LiteralPath $ExclusionsPath) {
-    foreach ($Entry in (Import-Csv -LiteralPath $ExclusionsPath)) {
-        if (-not [string]::IsNullOrWhiteSpace($Entry.SamAccountName)) {
-            $Key = $Entry.SamAccountName.Trim().ToLowerInvariant()
-            $Exclusions[$Key] = $Entry
+# ------------------------------------------------------------
+# Connect to Microsoft Graph
+# ------------------------------------------------------------
+
+Connect-MgGraph -Scopes @(
+    "User.Read.All"
+    "Directory.Read.All"
+    "AuditLog.Read.All"
+) -NoWelcome
+
+$GraphProperties = @(
+    "id"
+    "displayName"
+    "userPrincipalName"
+    "accountEnabled"
+    "onPremisesSyncEnabled"
+    "onPremisesSamAccountName"
+    "lastPasswordChangeDateTime"
+    "signInActivity"
+)
+
+Write-Host "Reading Microsoft Entra ID users..." -ForegroundColor Cyan
+
+$GraphUsers = Get-MgUser `
+    -All `
+    -Property $GraphProperties |
+    Select-Object `
+        Id,
+        DisplayName,
+        UserPrincipalName,
+        AccountEnabled,
+        OnPremisesSyncEnabled,
+        OnPremisesSamAccountName,
+        LastPasswordChangeDateTime,
+        @{
+            Name = "LastSuccessfulSignInDateTime"
+            Expression = {
+                $_.SignInActivity.LastSuccessfulSignInDateTime
+            }
+        },
+        @{
+            Name = "LastInteractiveSignInDateTime"
+            Expression = {
+                $_.SignInActivity.LastSignInDateTime
+            }
+        },
+        @{
+            Name = "LastNonInteractiveSignInDateTime"
+            Expression = {
+                $_.SignInActivity.LastNonInteractiveSignInDateTime
+            }
         }
+
+$GraphByUpn = @{}
+
+foreach ($GraphUser in $GraphUsers) {
+    if (-not :IsNullOrWhiteSpace($GraphUser.UserPrincipalName)) {
+        $GraphByUpn[$GraphUser.UserPrincipalName.ToLowerInvariant()] = $GraphUser
     }
 }
 
-# Microsoft Entra users are indexed by normalized UPN. Multiple matches are kept
-# so that ambiguous correlations can be sent to manual review.
-$GraphUsersByUpn = @{}
-$GraphAvailable = $false
-if (-not $SkipMicrosoftGraph) {
-    Import-Module Microsoft.Graph.Authentication -ErrorAction Stop
-    Import-Module Microsoft.Graph.Users -ErrorAction Stop
-
-    Connect-MgGraph -Scopes 'User.Read.All', 'AuditLog.Read.All'
-    try {
-        $GraphProperties = @(
-            'id'
-            'displayName'
-            'userPrincipalName'
-            'accountEnabled'
-            'onPremisesSyncEnabled'
-            'signInActivity'
-        )
-
-        $GraphUsers = @(Get-MgUser -All -Property $GraphProperties)
-        foreach ($GraphUser in $GraphUsers) {
-            if ([string]::IsNullOrWhiteSpace($GraphUser.UserPrincipalName)) {
-                continue
-            }
-
-            $Key = $GraphUser.UserPrincipalName.Trim().ToLowerInvariant()
-            if (-not $GraphUsersByUpn.ContainsKey($Key)) {
-                $GraphUsersByUpn[$Key] = @()
-            }
-            $GraphUsersByUpn[$Key] += $GraphUser
-        }
-        $GraphAvailable = $true
-    }
-    finally {
-        Disconnect-MgGraph -ErrorAction SilentlyContinue | Out-Null
-    }
-}
+# ------------------------------------------------------------
+# Read Active Directory
+# ------------------------------------------------------------
 
 $Forest = Get-ADForest
-$Results = [System.Collections.Generic.List[object]]::new()
+$ADUsers = @()
 
-foreach ($Domain in $Forest.Domains) {
-    $DomainController = Get-ADDomainController -Discover -DomainName $Domain -Writable
-    Write-Host "Reading users from $Domain"
+foreach ($DomainName in $Forest.Domains) {
+    Write-Host "Reading Active Directory users from $DomainName..." -ForegroundColor Cyan
 
-    $ADUsers = Get-ADUser -Server $DomainController.HostName -Filter * -Properties @(
-        'UserPrincipalName'
-        'Mail'
-        'Enabled'
-        'WhenCreated'
-        'WhenChanged'
-        'pwdLastSet'
-        'lastLogonTimestamp'
-        'ObjectGUID'
-        'ObjectSID'
-        'adminCount'
-        'isCriticalSystemObject'
-        'ServicePrincipalName'
-    )
+    $DomainController = (
+        Get-ADDomainController -Discover -DomainName $DomainName -Writable
+    ).HostName
 
-    foreach ($ADUser in $ADUsers) {
-        $Upn = $null
-        if (-not [string]::IsNullOrWhiteSpace($ADUser.UserPrincipalName)) {
-            $Upn = $ADUser.UserPrincipalName.Trim().ToLowerInvariant()
-        }
+    $DomainUsers = Get-ADUser `
+        -Server $DomainController `
+        -Filter * `
+        -Properties @(
+            "DisplayName"
+            "UserPrincipalName"
+            "Enabled"
+            "ObjectGUID"
+            "ObjectSID"
+            "DistinguishedName"
+            "whenCreated"
+            "whenChanged"
+            "lastLogonTimestamp"
+            "pwdLastSet"
+            "PasswordNeverExpires"
+            "PasswordNotRequired"
+            "ServicePrincipalName"
+        )
 
+    foreach ($ADUser in $DomainUsers) {
         $ADLastLogon = $null
-        if ([int64]$ADUser.lastLogonTimestamp -gt 0) {
-            $ADLastLogon = [DateTime]::FromFileTimeUtc([int64]$ADUser.lastLogonTimestamp).ToLocalTime()
-        }
-
         $ADPasswordLastSet = $null
-        if ([int64]$ADUser.pwdLastSet -gt 0) {
-            $ADPasswordLastSet = [DateTime]::FromFileTimeUtc([int64]$ADUser.pwdLastSet).ToLocalTime()
+
+        if ($ADUser.lastLogonTimestamp -and $ADUser.lastLogonTimestamp -gt 0) {
+            $ADLastLogon = [DateTime]::FromFileTime(
+                [Int64]$ADUser.lastLogonTimestamp
+            )
         }
 
-        $GraphMatches = @()
-        if ($GraphAvailable -and $Upn -and $GraphUsersByUpn.ContainsKey($Upn)) {
-            $GraphMatches = @($GraphUsersByUpn[$Upn])
+        if ($ADUser.pwdLastSet -and $ADUser.pwdLastSet -gt 0) {
+            $ADPasswordLastSet = [DateTime]::FromFileTime(
+                [Int64]$ADUser.pwdLastSet
+            )
         }
 
-        $GraphUser = $null
-        $EntraLastSuccessfulSignIn = $null
-        if ($GraphMatches.Count -eq 1) {
-            $GraphUser = $GraphMatches[0]
-            if ($GraphUser.SignInActivity.LastSuccessfulSignInDateTime) {
-                $EntraLastSuccessfulSignIn = [DateTime]$GraphUser.SignInActivity.LastSuccessfulSignInDateTime
-            }
+        $Rid = $null
+
+        if ($ADUser.SID) {
+            $Rid = $ADUser.SID.Value.Split("-"[-1])
         }
 
-        $Reasons = [System.Collections.Generic.List[string]]::new()
-        $SamKey = $ADUser.SamAccountName.ToLowerInvariant()
-        $Rid = $ADUser.ObjectSID.Value.Split('-')[-1]
-
-        if ($Rid -in @('500', '501', '502', '503')) {
-            [void]$Reasons.Add('Built-in account RID')
+        $ADUsers += [PSCustomObject]@{
+            Domain                  = $DomainName
+            DomainController        = $DomainController
+            DisplayName             = $ADUser.DisplayName
+            SamAccountName          = $ADUser.SamAccountName
+            UserPrincipalName       = $ADUser.UserPrincipalName
+            ADEnabled               = $ADUser.Enabled
+            ADObjectGuid            = $ADUser.ObjectGUID
+            ADSid                   = $ADUser.SID.Value
+            RID                     = $Rid
+            DistinguishedName       = $ADUser.DistinguishedName
+            WhenCreated             = $ADUser.whenCreated
+            WhenChanged             = $ADUser.whenChanged
+            ADLastLogonTimestamp    = $ADLastLogon
+            ADPasswordLastSet       = $ADPasswordLastSet
+            PasswordNeverExpires    = $ADUser.PasswordNeverExpires
+            PasswordNotRequired     = $ADUser.PasswordNotRequired
+            HasServicePrincipalName = [bool]$ADUser.ServicePrincipalName
         }
-        if ($ADUser.isCriticalSystemObject) {
-            [void]$Reasons.Add('Critical system object')
-        }
-        if ($Exclusions.ContainsKey($SamKey)) {
-            $Reason = $Exclusions[$SamKey].Reason
-            if ([string]::IsNullOrWhiteSpace($Reason)) {
-                $Reason = 'Explicit exclusion'
-            }
-            [void]$Reasons.Add($Reason)
-        }
-
-        $Excluded = $Reasons.Count -gt 0
-        $ReviewFlags = [System.Collections.Generic.List[string]]::new()
-
-        if ($ADUser.adminCount -eq 1) {
-            [void]$ReviewFlags.Add('Privileged or formerly privileged account')
-        }
-        if (@($ADUser.ServicePrincipalName).Count -gt 0 -or $ADUser.SamAccountName -match '^(svc|service)[-_.]') {
-            [void]$ReviewFlags.Add('Possible service account')
-        }
-        if (-not $Upn) {
-            [void]$ReviewFlags.Add('Missing AD UPN')
-        }
-        elseif (-not $GraphAvailable) {
-            [void]$ReviewFlags.Add('Microsoft Graph data not collected')
-        }
-        elseif ($GraphMatches.Count -eq 0) {
-            [void]$ReviewFlags.Add('No Entra UPN match')
-        }
-        elseif ($GraphMatches.Count -gt 1) {
-            [void]$ReviewFlags.Add('Multiple Entra UPN matches')
-        }
-        elseif ($GraphUser.OnPremisesSyncEnabled -ne $true) {
-            [void]$ReviewFlags.Add('Entra match is not confirmed as synchronized')
-        }
-
-        $Classification = 'Not stale'
-        if ($Excluded) {
-            $Classification = 'Excluded'
-        }
-        elseif (-not $ADUser.Enabled) {
-            if ($ADUser.WhenChanged -le $DisabledCutoff) {
-                $Classification = 'Disabled aged candidate - owner validation required'
-            }
-            else {
-                $Classification = 'Disabled - retention period not reached'
-            }
-        }
-        elseif ($ReviewFlags.Count -gt 0) {
-            $Classification = 'Manual review - ' + ($ReviewFlags -join '; ')
-        }
-        elseif ($ADUser.WhenCreated -gt $StaleCutoff) {
-            $Classification = 'Not stale - recently created'
-        }
-        elseif (-not $ADLastLogon) {
-            $Classification = 'Manual review - missing AD logon data'
-        }
-        elseif (-not $EntraLastSuccessfulSignIn) {
-            $Classification = 'Manual review - missing Entra sign-in data'
-        }
-        elseif (($ADLastLogon -le $StaleCutoff) -and ($EntraLastSuccessfulSignIn -le $StaleCutoff)) {
-            $Classification = 'Enabled stale candidate - owner validation required'
-        }
-
-        $Result = [pscustomobject][ordered]@{
-            SamAccountName                = $ADUser.SamAccountName
-            UserPrincipalName             = $ADUser.UserPrincipalName
-            DisplayName                   = $ADUser.Name
-            SourceDomain                  = $Domain
-            DomainController              = $DomainController.HostName
-            ADObjectGuid                  = $ADUser.ObjectGUID
-            ADEnabled                     = $ADUser.Enabled
-            ADCreated                     = $ADUser.WhenCreated
-            ADChanged                     = $ADUser.WhenChanged
-            ADLastLogonTimestamp          = $ADLastLogon
-            ADPasswordLastSet             = $ADPasswordLastSet
-            EntraObjectId                 = if ($GraphUser) { $GraphUser.Id } else { $null }
-            EntraAccountEnabled           = if ($GraphUser) { $GraphUser.AccountEnabled } else { $null }
-            OnPremisesSyncEnabled         = if ($GraphUser) { $GraphUser.OnPremisesSyncEnabled } else { $null }
-            EntraLastSuccessfulSignIn     = $EntraLastSuccessfulSignIn
-            Excluded                      = $Excluded
-            ExclusionReason               = $Reasons -join '; '
-            Classification                = $Classification
-        }
-
-        [void]$Results.Add($Result)
     }
 }
 
-$Stamp = $RunDate.ToString('yyyy-MM-dd')
-$AllUsersPath = Join-Path $OutputPath "AllUsers-$Stamp.csv"
-$EnabledStalePath = Join-Path $OutputPath "EnabledStaleCandidates-$Stamp.csv"
-$DisabledAgedPath = Join-Path $OutputPath "DisabledAgedCandidates-$Stamp.csv"
-$ManualReviewPath = Join-Path $OutputPath "ManualReview-$Stamp.csv"
-$ExcludedPath = Join-Path $OutputPath "ExcludedUsers-$Stamp.csv"
+# ------------------------------------------------------------
+# Correlate AD and Entra evidence
+# ------------------------------------------------------------
 
-$Results | Sort-Object SourceDomain, SamAccountName | Export-Csv -Path $AllUsersPath -NoTypeInformation -Encoding UTF8
-$Results | Where-Object Classification -eq 'Enabled stale candidate - owner validation required' |
-    Sort-Object SourceDomain, SamAccountName | Export-Csv -Path $EnabledStalePath -NoTypeInformation -Encoding UTF8
-$Results | Where-Object Classification -eq 'Disabled aged candidate - owner validation required' |
-    Sort-Object SourceDomain, SamAccountName | Export-Csv -Path $DisabledAgedPath -NoTypeInformation -Encoding UTF8
-$Results | Where-Object Classification -like 'Manual review*' |
-    Sort-Object SourceDomain, SamAccountName | Export-Csv -Path $ManualReviewPath -NoTypeInformation -Encoding UTF8
-$Results | Where-Object Excluded -eq $true |
-    Sort-Object SourceDomain, SamAccountName | Export-Csv -Path $ExcludedPath -NoTypeInformation -Encoding UTF8
+$Results = foreach ($ADUser in $ADUsers) {
+    $GraphUser = $null
+    $MatchStatus = "ADOnly"
 
-Write-Host "Reports created in $OutputPath"
-Write-Host "All users: $($Results.Count)"
-Write-Host "Enabled stale candidates: $(@($Results | Where-Object Classification -eq 'Enabled stale candidate - owner validation required').Count)"
-Write-Host "Disabled aged candidates: $(@($Results | Where-Object Classification -eq 'Disabled aged candidate - owner validation required').Count)"
-Write-Host "Manual review: $(@($Results | Where-Object Classification -like 'Manual review*').Count)"
-Write-Host "Excluded: $(@($Results | Where-Object Excluded -eq $true).Count)"
+    if (-not :IsNullOrWhiteSpace($ADUser.UserPrincipalName)) {
+        $UpnKey = $ADUser.UserPrincipalName.ToLowerInvariant()
+
+        if ($GraphByUpn.ContainsKey($UpnKey)) {
+            $GraphUser = $GraphByUpn[$UpnKey]
+            $MatchStatus = "Matched"
+        }
+    }
+
+    $EntraLastSuccessfulSignIn = $null
+    $EntraPasswordLastChanged = $null
+    $EntraEnabled = $null
+    $EntraObjectId = $null
+    $OnPremisesSyncEnabled = $null
+
+    if ($GraphUser) {
+        $EntraEnabled = $GraphUser.AccountEnabled
+        $EntraObjectId = $GraphUser.Id
+        $OnPremisesSyncEnabled = $GraphUser.OnPremisesSyncEnabled
+
+        if ($GraphUser.LastSuccessfulSignInDateTime) {
+            $EntraLastSuccessfulSignIn = [DateTime]$GraphUser.LastSuccessfulSignInDateTime
+        }
+
+        if ($GraphUser.LastPasswordChangeDateTime) {
+            $EntraPasswordLastChanged = [DateTime]$GraphUser.LastPasswordChangeDateTime
+        }
+    }
+
+    $Excluded = $false
+    $ExclusionReason = $null
+
+    if ($ADUser.SamAccountName -in $BuiltInNames) {
+        $Excluded = $true
+        $ExclusionReason = "Built-in account name"
+    }
+
+    if ($ADUser.RID -in @(500, 501, 502)) {
+        $Excluded = $true
+        $ExclusionReason = "Well-known built-in account RID"
+    }
+
+    $CustomMatch = $CustomExclusions |
+        Where-Object {
+            $_.SamAccountName -and
+            $_.SamAccountName -ieq $ADUser.SamAccountName
+        } |
+        Select-Object -First 1
+
+    if ($CustomMatch) {
+        $Excluded = $true
+        $ExclusionReason = $CustomMatch.Reason
+    }
+
+    $ADActivityStatus = "Missing"
+    $EntraActivityStatus = "NotApplicable"
+
+    if ($ADUser.ADLastLogonTimestamp) {
+        if ($ADUser.ADLastLogonTimestamp -lt $StaleCutoff) {
+            $ADActivityStatus = "Old"
+        }
+        else {
+            $ADActivityStatus = "Recent"
+        }
+    }
+
+    if ($GraphUser) {
+        $EntraActivityStatus = "Missing"
+
+        if ($EntraLastSuccessfulSignIn) {
+            if ($EntraLastSuccessfulSignIn -lt $StaleCutoff) {
+                $EntraActivityStatus = "Old"
+            }
+            else {
+                $EntraActivityStatus = "Recent"
+            }
+        }
+    }
+
+    $Classification = "Review"
+    $ClassificationReason = "Insufficient or conflicting activity evidence"
+
+    if ($Excluded) {
+        $Classification = "Excluded"
+        $ClassificationReason = $ExclusionReason
+    }
+    elseif ($ADActivityStatus -eq "Recent" -or $EntraActivityStatus -eq "Recent") {
+        $Classification = "Active"
+        $ClassificationReason = "Recent activity exists in AD or Microsoft Entra ID"
+    }
+    elseif (
+        $MatchStatus -eq "Matched" -and
+        $ADActivityStatus -eq "Old" -and
+        $EntraActivityStatus -eq "Old"
+    ) {
+        $Classification = "Stale"
+        $ClassificationReason = "AD and Entra activity are both older than the threshold"
+    }
+    elseif (
+        $MatchStatus -eq "ADOnly" -and
+        $ADActivityStatus -eq "Old"
+    ) {
+        $Classification = "Review"
+        $ClassificationReason = "AD-only account has old activity and requires owner review"
+    }
+
+    $ADPasswordAgeDays = $null
+    $EntraPasswordAgeDays = $null
+    $PasswordReview = $false
+
+    if ($ADUser.ADPasswordLastSet) {
+        $ADPasswordAgeDays = (
+            (Get-Date) - $ADUser.ADPasswordLastSet
+        ).Days
+
+        if ($ADUser.ADPasswordLastSet -lt $PasswordCutoff) {
+            $PasswordReview = $true
+        }
+    }
+
+    if ($EntraPasswordLastChanged) {
+        $EntraPasswordAgeDays = (
+            (Get-Date) - $EntraPasswordLastChanged
+        ).Days
+
+        if ($EntraPasswordLastChanged -lt $PasswordCutoff) {
+            $PasswordReview = $true
+        }
+    }
+
+    [PSCustomObject]@{
+        Classification                    = $Classification
+        ClassificationReason              = $ClassificationReason
+        Excluded                          = $Excluded
+        ExclusionReason                   = $ExclusionReason
+        MatchStatus                       = $MatchStatus
+        DisplayName                       = $ADUser.DisplayName
+        UserPrincipalName                 = $ADUser.UserPrincipalName
+        SamAccountName                    = $ADUser.SamAccountName
+        Domain                            = $ADUser.Domain
+        DistinguishedName                 = $ADUser.DistinguishedName
+        ADEnabled                         = $ADUser.ADEnabled
+        EntraEnabled                      = $EntraEnabled
+        OnPremisesSyncEnabled             = $OnPremisesSyncEnabled
+        ADLastLogonTimestamp              = $ADUser.ADLastLogonTimestamp
+        EntraLastSuccessfulSignInDateTime = $EntraLastSuccessfulSignIn
+        ADActivityStatus                  = $ADActivityStatus
+        EntraActivityStatus               = $EntraActivityStatus
+        ADPasswordLastSet                 = $ADUser.ADPasswordLastSet
+        ADPasswordAgeDays                 = $ADPasswordAgeDays
+        EntraPasswordLastChanged          = $EntraPasswordLastChanged
+        EntraPasswordAgeDays              = $EntraPasswordAgeDays
+        PasswordReview                    = $PasswordReview
+        PasswordNeverExpires              = $ADUser.PasswordNeverExpires
+        PasswordNotRequired               = $ADUser.PasswordNotRequired
+        HasServicePrincipalName           = $ADUser.HasServicePrincipalName
+        WhenCreated                       = $ADUser.WhenCreated
+        WhenChanged                       = $ADUser.WhenChanged
+        ADObjectGuid                      = $ADUser.ADObjectGuid
+        EntraObjectId                     = $EntraObjectId
+        DomainController                  = $ADUser.DomainController
+        StaleThresholdDays                = $StaleDays
+        PasswordReviewThresholdDays       = $PasswordReviewDays
+        ReportGenerated                   = Get-Date
+    }
+}
+
+# ------------------------------------------------------------
+# Add cloud-only users
+# ------------------------------------------------------------
+
+$ADUpns = @{}
+
+foreach ($ADUser in $ADUsers) {
+    if (-not :IsNullOrWhiteSpace($ADUser.UserPrincipalName)) {
+        $ADUpns[$ADUser.UserPrincipalName.ToLowerInvariant()] = $true
+    }
+}
+
+foreach ($GraphUser in $GraphUsers) {
+    if (:IsNullOrWhiteSpace($GraphUser.UserPrincipalName)) {
+        continue
+    }
+
+    $UpnKey = $GraphUser.UserPrincipalName.ToLowerInvariant()
+
+    if ($ADUpns.ContainsKey($UpnKey)) {
+        continue
+    }
+
+    $EntraLastSuccessfulSignIn = $null
+    $EntraPasswordLastChanged = $null
+
+    if ($GraphUser.LastSuccessfulSignInDateTime) {
+        $EntraLastSuccessfulSignIn = [DateTime]$GraphUser.LastSuccessfulSignInDateTime
+    }
+
+    if ($GraphUser.LastPasswordChangeDateTime) {
+        $EntraPasswordLastChanged = [DateTime]$GraphUser.LastPasswordChangeDateTime
+    }
+
+    $EntraActivityStatus = "Missing"
+    $Classification = "Review"
+    $ClassificationReason = "No successful Entra sign-in value is available"
+
+    if ($EntraLastSuccessfulSignIn) {
+        if ($EntraLastSuccessfulSignIn -lt $StaleCutoff) {
+            $EntraActivityStatus = "Old"
+            $Classification = "Stale"
+            $ClassificationReason = "Cloud-only account activity is older than the threshold"
+        }
+        else {
+            $EntraActivityStatus = "Recent"
+            $Classification = "Active"
+            $ClassificationReason = "Recent Microsoft Entra activity exists"
+        }
+    }
+
+    $EntraPasswordAgeDays = $null
+    $PasswordReview = $false
+
+    if ($EntraPasswordLastChanged) {
+        $EntraPasswordAgeDays = (
+            (Get-Date) - $EntraPasswordLastChanged
+        ).Days
+
+        if ($EntraPasswordLastChanged -lt $PasswordCutoff) {
+            $PasswordReview = $true
+        }
+    }
+
+    $Results += [PSCustomObject]@{
+        Classification                    = $Classification
+        ClassificationReason              = $ClassificationReason
+        Excluded                          = $false
+        ExclusionReason                   = $null
+        MatchStatus                       = "CloudOnly"
+        DisplayName                       = $GraphUser.DisplayName
+        UserPrincipalName                 = $GraphUser.UserPrincipalName
+        SamAccountName                    = $GraphUser.OnPremisesSamAccountName
+        Domain                            = $null
+        DistinguishedName                 = $null
+        ADEnabled                         = $null
+        EntraEnabled                      = $GraphUser.AccountEnabled
+        OnPremisesSyncEnabled             = $GraphUser.OnPremisesSyncEnabled
+        ADLastLogonTimestamp              = $null
+        EntraLastSuccessfulSignInDateTime = $EntraLastSuccessfulSignIn
+        ADActivityStatus                  = "NotApplicable"
+        EntraActivityStatus               = $EntraActivityStatus
+        ADPasswordLastSet                 = $null
+        ADPasswordAgeDays                 = $null
+        EntraPasswordLastChanged          = $EntraPasswordLastChanged
+        EntraPasswordAgeDays              = $EntraPasswordAgeDays
+        PasswordReview                    = $PasswordReview
+        PasswordNeverExpires              = $null
+        PasswordNotRequired               = $null
+        HasServicePrincipalName           = $null
+        WhenCreated                       = $null
+        WhenChanged                       = $null
+        ADObjectGuid                      = $null
+        EntraObjectId                     = $GraphUser.Id
+        DomainController                  = $null
+        StaleThresholdDays                = $StaleDays
+        PasswordReviewThresholdDays       = $PasswordReviewDays
+        ReportGenerated                   = Get-Date
+    }
+}
+
+# ------------------------------------------------------------
+# Export
+# ------------------------------------------------------------
+
+$Results |
+    Sort-Object Classification, UserPrincipalName |
+    Export-Csv -Path $ReportPath -NoTypeInformation -Encoding UTF8
+
+Disconnect-MgGraph | Out-Null
+
+Write-Host ""
+Write-Host "Report created successfully:" -ForegroundColor Green
+Write-Host $ReportPath -ForegroundColor Green
+Write-Host ""
+Write-Host "No accounts were changed." -ForegroundColor Yellow
+Write-Host "Review all Stale and Review results before remediation." -ForegroundColor Yellow
