@@ -1,0 +1,54 @@
+# Generated reports
+*.csv
+*.xlsx
+*.xls
+*.json
+*.xml
+
+# PowerShell transcripts and logs
+*.log
+*.etl
+PowerShell_transcript.*
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.old
+~*
+
+# Local configuration and secrets
+.env
+.env.*
+*.secret
+*.secrets
+secrets.*
+config.local.*
+credentials.*
+
+# Certificates and keys
+*.pfx
+*.p12
+*.cer
+*.crt
+*.pem
+*.key
+
+# PowerShell module output
+bin/
+obj/
+out/
+output/
+reports/
+
+# Editor metadata
+.vscode/
+.idea/
+
+# Operating-system metadata
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Keep sanitised examples
+!examples/*.example.csv
