@@ -1,4 +1,4 @@
-SamAccountName,Reason
-svc-example,Application service account
-breakglass-admin,Emergency access account
-shared-operations,Approved shared operational account
+SamAccountName,UserPrincipalName,Reason
+svc-example,,Application service account
+breakglass-admin,breakglass-admin@example.com,Emergency access account
+shared-example,shared-example@example.com,Shared operational account
