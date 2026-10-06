@@ -2,7 +2,7 @@
 
 A report-first PowerShell framework for identifying and reviewing potentially stale on-premises Active Directory user accounts, enriched with matching Microsoft Entra ID sign-in information where available.
 
-The framework correlates on-premises and cloud activity, separates missing information from confirmed inactivity, excludes built-in and possible service accounts, and validates provisional disabled-aged accounts across the writable domain controllers returned for their source domain.
+The framework correlates on-premises and cloud activity, separates missing information from confirmed inactivity, excludes built-in and possible service accounts, and validates the modified date of disabled stale candidates across all writable domain controllers returned for their source domain.
 
 > [!IMPORTANT]
 > This framework is Active Directory-led. It does not inventory cloud-only users, Microsoft Entra guests without matching AD accounts, managed service accounts, group managed service accounts, service principals, application registrations, or computer accounts.
@@ -60,7 +60,7 @@ The PowerShell example in this repository was generated with the assistance of A
 
 It is not a copy of any production script and does not contain customer names, account information, tenant details, domain names, server names, file paths, organisational structures, or other environment-specific information.
 
-The script has been statically reviewed for PowerShell syntax, logical consistency, null handling, date comparison, read-only Microsoft Graph permissions, exclusion processing, report construction, and cross-domain-controller validation logic. It has not been executed or tested against a live Active Directory forest or Microsoft Entra tenant.
+The script has been statically reviewed for PowerShell syntax, logical consistency, null handling, date comparison, read-only Microsoft Graph permissions, exclusion processing, report construction, and writable-domain-controller validation logic. It has not been executed or tested against a live Active Directory forest or Microsoft Entra tenant.
 
 Treat it as an educational framework, not a production-ready solution. Review, adapt, and test it in an isolated non-production environment before using it with organisational data.
 
@@ -115,14 +115,14 @@ For the strongest implementation, the classification logic should send a matchin
 
 1. Discovers the domains in the current AD forest.
 2. Selects a writable DC in each domain for initial collection.
-3. Retrieves a defined set of AD user properties.
+3. Retrieves a defined set of AD user properties, including the replicated `lastLogonTimestamp` value.
 4. Retrieves Entra users and sign-in activity through Microsoft Graph.
 5. Matches AD and Entra identities by normalised UPN.
-6. Applies built-in, privilege, service-account, OU, and explicit exclusions.
+6. Applies built-in, service-account, and explicit exclusions.
 7. Calculates AD and Entra inactivity independently.
-8. Creates provisional disabled-aged candidates from one DC per domain.
-9. Revalidates only those provisional candidates against all writable DCs returned for their source domain.
-10. Exports evidence, exclusion, candidate, and manual-review reports.
+8. Creates provisional disabled stale candidates by using the replicated AD logon information.
+9. Queries `whenChanged` from all writable DCs only for disabled stale candidates.
+10. Exports complete, stale-candidate, disabled-stale, and DC-validation-failure reports.
 
 Dates remain `DateTime` values during comparison. They are not converted to formatted strings before stale calculations are performed.
 
@@ -131,29 +131,31 @@ Dates remain `DateTime` values during comparison. They are not converted to form
 The example defaults are:
 
 ```powershell
-$StaleAfterDays = 90
-$DisabledRetentionDays = 180
+$StaleDays = 180
+$MinimumAccountAgeDays = 90
 ```
 
 These are example values, not universal Microsoft requirements. Each organisation must define thresholds that match its lifecycle, regulatory, operational, and risk requirements.
 
 ### Enabled stale candidate
 
-An AD user with a matching Entra user becomes an enabled stale candidate only when:
+An AD user with a matching Entra user becomes a stale candidate only when:
 
-1. The AD account is enabled.
-2. The account is older than the selected stale threshold.
-3. `lastLogonTimestamp` is older than the threshold.
-4. `lastSuccessfulSignInDateTime` is older than the threshold.
-5. Both activity values are available.
-6. No exclusion applies.
+1. The account is older than the configured minimum account-age period.
+2. `lastLogonTimestamp` is older than the stale threshold.
+3. `lastSuccessfulSignInDateTime` is older than the stale threshold.
+4. Both activity values are available.
+5. No exclusion applies.
+6. The account does not require service-account review.
 7. Identity correlation has been validated.
 
 The classification is:
 
 ```text
-Enabled stale candidate - owner validation required
+Stale - owner validation required
 ```
+
+A recent activity value in either AD or Entra results in an active classification.
 
 ### Matching Entra object not confirmed as synchronised
 
@@ -163,9 +165,17 @@ If a UPN match is found but `OnPremisesSyncEnabled` is not `True`, the recommend
 Manual review - matching Entra object is not confirmed as synchronised
 ```
 
+### AD-only account
+
+An AD-only account with an old `lastLogonTimestamp` is sent to manual review. The absence of an Entra match is not treated as proof that the account is safe to disable or delete.
+
 ### Incomplete or unmatched information
 
 Missing dates, a missing Entra match, or conflicting signals result in manual review. Missing information is not evidence of inactivity.
+
+### Recently created accounts
+
+Accounts created within the configured minimum account-age period are not classified as stale. This helps prevent newly provisioned accounts with little or no activity history from entering the stale-account process prematurely.
 
 ## Understanding the activity attributes
 
@@ -173,17 +183,13 @@ Missing dates, a missing Entra match, or conflicting signals result in manual re
 
 A replicated approximation suitable for broad AD inactivity reporting. It does not update on every logon and must not be presented as the exact latest domain authentication.
 
+The framework uses this replicated value for its initial AD inactivity assessment and does not query the non-replicated `lastLogon` attribute.
+
 See [Microsoft lastLogonTimestamp documentation](https://learn.microsoft.com/en-us/windows/win32/adschema/a-lastlogontimestamp).
-
-### `lastLogon`
-
-Updated on the DC that processes the logon and not replicated. An accurate domain-wide value requires querying every DC and selecting the largest value.
-
-See [Microsoft lastLogon documentation](https://learn.microsoft.com/en-us/windows/win32/adschema/a-lastlogon).
 
 ### `lastSuccessfulSignInDateTime`
 
-The most recent successful interactive or non-interactive Entra sign-in. Microsoft notes that the property became available on 1 December 2023 and was not backfilled.
+The most recent successful interactive or non-interactive Entra sign-in exposed through the sign-in activity resource. Microsoft notes that this property is not a complete historical record and should be interpreted with its documented availability and licensing requirements.
 
 See [Microsoft Graph sign-in activity documentation](https://learn.microsoft.com/en-us/graph/api/resources/signinactivity?view=graph-rest-1.0).
 
@@ -192,6 +198,12 @@ See [Microsoft Graph sign-in activity documentation](https://learn.microsoft.com
 The date and time at which the AD password was last changed. It is useful for password hygiene but does not prove account inactivity.
 
 See [Microsoft pwdLastSet documentation](https://learn.microsoft.com/en-us/windows/win32/adschema/a-pwdlastset).
+
+### `lastPasswordChangeDateTime`
+
+The Entra date and time at which the password was last changed. It is collected as supporting evidence where available but is not used as proof of inactivity.
+
+See [Microsoft Graph user resource documentation](https://learn.microsoft.com/en-us/graph/api/resources/user?view=graph-rest-1.0).
 
 ### `whenCreated`
 
@@ -205,33 +217,42 @@ See [Microsoft whenChanged documentation](https://learn.microsoft.com/en-us/wind
 
 ## Validating disabled accounts across domain controllers
 
-Querying every user against every DC would add substantial overhead. The framework therefore uses two passes.
+Querying every user against every writable DC would add unnecessary overhead. The framework therefore performs the additional domain-controller validation only for disabled stale candidates.
 
 ### First pass
 
-A disabled, non-excluded account becomes a provisional disabled-aged candidate when the `whenChanged` value returned by the initial writable DC is older than the configured threshold.
+A disabled, non-excluded account becomes a provisional disabled stale candidate when:
+
+1. The AD account is disabled.
+2. The account is older than the configured minimum account-age period.
+3. The replicated `lastLogonTimestamp` value is available and older than the stale threshold.
+4. No built-in or explicit exclusion applies.
+5. The account does not require service-account review.
 
 ### Second pass
 
-Only provisional candidates are queried against every writable DC returned by `Get-ADDomainController -Filter *` for the account's source domain.
+Only provisional disabled stale candidates are queried against all writable DCs returned by:
+
+```powershell
+Get-ADDomainController -Filter *
+```
+
+for the account's source domain.
 
 For each candidate, the framework:
 
 1. Queries the account by AD object GUID.
-2. Retrieves `Enabled` and `whenChanged`.
+2. Retrieves the local `whenChanged` value from each writable DC.
 3. Records successful and failed queries.
-4. Selects the most recent local `whenChanged` value returned by successful queries.
-5. Confirms that all successful observations report the account as disabled.
-6. Removes the account from the final list if any successful query returns a more recent object-change value.
-7. Sends the account to manual review if any returned writable DC cannot be queried.
+4. Selects the most recent `whenChanged` value returned by the writable DCs.
+5. Confirms that the most recent value is older than the stale threshold.
+6. Sends the account to manual review if any writable DC cannot be queried.
 
-The final description is deliberately precise:
+The account is marked as a disabled stale candidate only when every writable DC responds and the newest returned `whenChanged` value is older than the configured threshold.
 
-```text
-Disabled - object unchanged beyond threshold across validated DCs
-```
+The validation fails closed. A failed DC query does not produce a confirmed disabled stale result.
 
-It does not claim to identify the exact disablement date or originating modification time.
+The result does not claim that `whenChanged` is the exact disablement date. It shows only the most recent object-modification date returned by the validated writable DCs.
 
 ## Built-in account exclusions
 
@@ -239,7 +260,7 @@ The framework excludes predefined domain users by SID suffix:
 
 - RID 500: Administrator
 - RID 501: Guest
-- RID 502: krbtgt, used by the Key Distribution Center service
+- RID 502: `krbtgt`, used by the Key Distribution Center service
 
 SID matching is the primary control because built-in accounts can be renamed. Name matching remains a secondary safeguard.
 
@@ -247,269 +268,294 @@ See [Microsoft predefined RIDs](https://learn.microsoft.com/en-us/openspecs/wind
 
 ## Service-account exclusions
 
-No single AD attribute proves that a normal user object is a service account. The framework combines indicators and reports service-account candidates.
+No single AD attribute proves that a normal user object is a service account. The framework flags accounts with one or more service principal names for manual service-owner review.
 
-Indicators include:
+A service principal name is an indicator, not proof that an object is a service account. These accounts are not automatically treated as ordinary stale users.
 
-- `PasswordNeverExpires`
-- One or more SPNs
-- Configurable naming patterns
-- Configurable OU patterns
-- Explicit exclusions
-
-A non-expiring password may also be a policy exception or misconfiguration. It is reported separately and excluded from ordinary stale-user handling.
+A non-expiring password may also represent a policy exception or misconfiguration. It is reported separately and should be reviewed according to organisational policy.
 
 ### Managed service accounts
 
-The script queries normal user objects with `Get-ADUser`. It does not inventory standalone managed service accounts or group managed service accounts. Review those separately with `Get-ADServiceAccount` and an appropriate lifecycle process.
-
-See [Microsoft Get-ADServiceAccount documentation](https://learn.microsoft.com/en-us/powershell/module/activedirectory/get-adserviceaccount?view=windowsserver2025-ps).
+The script queries normal user objects with `Get-ADUser`. It does not inventory standalone managed service accounts or group managed service accounts.
 
 ## Explicit exclusions
 
-The example exclusions file uses a semicolon delimiter and AD object GUID:
+Use `UserExclusions.csv` to exclude approved identities that must not enter the normal stale-user workflow.
+
+The file can contain `SamAccountName`, `UserPrincipalName`, or both:
 
 ```csv
-ADObjectGUID;Reason;Owner;ReviewDate
-00000000-0000-0000-0000-000000000000;Emergency access identity;Identity Operations;2027-01-31
-11111111-1111-1111-1111-111111111111;Application dependency;Application Owner;2027-03-31
+SamAccountName,UserPrincipalName,Reason
+svc-example,,Application service account
+breakglass-admin,breakglass-admin@example.com,Emergency access account
+shared-example,shared-example@example.com,Shared operational account
 ```
 
-The values are fictional. Copy `examples/UserExclusions.example.csv` outside the repository before entering real data.
+The examples are fictional. Never commit a production exclusion file to a public repository.
 
-Every exclusion should have a reason, owner, review date, and immutable identifier.
+Common exclusions may include:
+
+- Privileged or administrative accounts
+- Emergency-access accounts
+- Service-linked identities
+- Shared or generic accounts
+- Mailbox-associated accounts requiring separate validation
+- Application or infrastructure accounts
+- Accounts belonging to users on approved extended leave
+- Accounts retained under a legal, regulatory, or operational requirement
+
+An exclusion is a risk-control decision. It should have a reason, an owner, and a review date outside the public repository.
 
 ## Prerequisites
 
+### PowerShell
+
+- Windows PowerShell 5.1 or a compatible supported PowerShell environment
+- Permission to run local scripts according to organisational policy
+
 ### Active Directory
 
-- Active Directory PowerShell module
-- Read access to the forest, domains, DCs, and required user attributes
-- Network access to each writable DC used during validation
+- The Active Directory PowerShell module
+- Network access to the domains and writable DCs in scope
+- Read permission for the user attributes collected by the script
 
-### Microsoft Graph
+The Active Directory module is available through the appropriate Remote Server Administration Tools capability or on supported administrative servers.
 
-The script imports:
+### Microsoft Graph PowerShell
+
+The following modules are required:
 
 ```powershell
 Microsoft.Graph.Authentication
 Microsoft.Graph.Users
 ```
 
-Microsoft's inactive-account guidance lists these prerequisites for `lastSuccessfulSignInDateTime`:
+The script requests delegated read scopes:
 
-- Microsoft Entra ID P1 or P2
-- `User.Read.All`
-- `AuditLog.Read.All`
-- An appropriate role, with Reports Reader identified as the least-privileged role for access to activity logs
+```text
+User.Read.All
+AuditLog.Read.All
+```
 
-See [Microsoft inactive-account guidance](https://learn.microsoft.com/en-us/entra/identity/monitoring-health/howto-manage-inactive-user-accounts).
+The operator must use an approved administrative identity and the tenant must permit the requested scopes. Sign-in activity availability is subject to Microsoft Entra licensing, permissions, retention, and service behavior.
 
-### Optional Excel output
+### Execution account
 
-CSV reporting requires no additional reporting module. Excel output requires the community `ImportExcel` module.
+Use a dedicated, approved administrative account with only the read access required to generate the report. Do not embed credentials, client secrets, certificates, tenant identifiers, access tokens, or proxy credentials in the script.
 
 ## Installation
 
+Clone the repository:
+
 ```powershell
 git clone https://github.com/christopherbaxter/Hybrid-Stale-User-Management.git
-Set-Location ".\Hybrid-Stale-User-Management"
+cd Hybrid-Stale-User-Management
 ```
 
-Copy the example exclusion file to a secure location outside the repository:
+If Git is unavailable, download the repository through the GitHub interface and extract it to an approved administrative workstation.
+
+Install the Microsoft Graph modules if they are not already present:
 
 ```powershell
-Copy-Item `
-    -Path ".\examples\UserExclusions.example.csv" `
-    -Destination "C:\SecureConfig\UserExclusions.csv"
+Install-Module Microsoft.Graph.Authentication -Scope CurrentUser
+Install-Module Microsoft.Graph.Users -Scope CurrentUser
 ```
+
+Install or enable the Active Directory PowerShell module by using the approved method for the operating system and organisation.
+
+Copy the exclusion example to a secure location outside the public repository before adding real account information.
 
 ## Running the script
 
-### CSV reporting
+Run the script with its default thresholds:
+
+```powershell
+.\scripts\Get-HybridStaleUserReport.ps1
+```
+
+Specify custom thresholds:
 
 ```powershell
 .\scripts\Get-HybridStaleUserReport.ps1 `
-    -StaleAfterDays 90 `
-    -DisabledRetentionDays 180 `
-    -OutputPath "C:\Reports\HybridStaleUsers" `
-    -ExclusionFile "C:\SecureConfig\UserExclusions.csv"
+    -StaleDays 180 `
+    -MinimumAccountAgeDays 90
 ```
 
-### CSV and Excel reporting
+Specify secure custom paths:
 
 ```powershell
 .\scripts\Get-HybridStaleUserReport.ps1 `
-    -StaleAfterDays 90 `
-    -DisabledRetentionDays 180 `
-    -OutputPath "C:\Reports\HybridStaleUsers" `
-    -ExclusionFile "C:\SecureConfig\UserExclusions.csv" `
-    -ExportExcel
+    -OutputFolder "C:\Reports\StaleUsers" `
+    -ExclusionFile "C:\SecureConfiguration\UserExclusions.csv"
 ```
 
-Store output in a protected location. Generated reports contain identity and directory information.
+The script connects interactively to Microsoft Graph, reads the required information, writes CSV reports, and disconnects from Graph. It does not modify any identity.
 
 ## Reports produced
 
-### `All-Hybrid-Users`
+The script creates the following CSV reports in the configured output folder.
 
-The complete AD user dataset collected by the script, enriched with matching Entra information where a UPN match was found. It does not include cloud-only or guest identities without a corresponding AD user.
+### Complete hybrid-user report
 
-### `Enabled-Stale-Candidates`
+```text
+All-Hybrid-Users-<date>.csv
+```
 
-Enabled, non-excluded accounts where both available activity signals exceed the configured threshold and identity correlation has been accepted.
+Contains all collected AD users, matching Entra evidence where available, exclusions, activity dates, password information, classification results, and disabled-account validation evidence.
 
-### `Excluded-Accounts`
+### Stale-user candidate report
 
-All excluded accounts and their reasons.
+```text
+Stale-User-Candidates-<date>.csv
+```
 
-### `Service-Account-Candidates`
+Contains matching AD and Entra users for which both the replicated AD activity date and Entra successful sign-in date are older than the configured threshold.
 
-Normal AD user objects that match one or more service-account indicators. This is not a complete service-identity inventory.
+### Disabled-stale candidate report
 
-### `Password-Never-Expires`
+```text
+Disabled-Stale-User-Candidates-<date>.csv
+```
 
-All collected AD users where `PasswordNeverExpires` is `True`.
+Contains disabled accounts for which the replicated AD activity date is old, all writable DCs responded, and the newest returned `whenChanged` value is older than the configured threshold.
 
-### `Disabled-Accounts`
+### DC-validation failure report
 
-All disabled AD users, regardless of age.
+```text
+Disabled-Stale-DC-Validation-Failures-<date>.csv
+```
 
-### `Provisional-Disabled-Stale`
+Contains disabled stale candidates for which one or more writable DCs could not be queried. These accounts require manual review and are not treated as confirmed disabled stale accounts.
 
-Intermediate candidates identified from the initial DC. This is not a deletion list.
-
-### `Validated-Disabled-Stale`
-
-Candidates validated against all returned writable DCs, with the most recent successful local `whenChanged` observation still beyond the threshold.
-
-### `Disabled-Stale-DC-Observations`
-
-One row per candidate per queried DC, including query outcome, enabled state, `whenChanged`, error information, and the selected latest observation.
-
-### `Incomplete-DC-Validation`
-
-Candidates for which one or more returned writable DCs could not be queried.
-
-### `Removed-After-Recent-DC-Change`
-
-Candidates removed after another DC returned a more recent object-change value.
-
-### `Manual-Review-Accounts`
-
-Accounts with incomplete, inconsistent, unmatched, or otherwise unsuitable evidence.
+Generated reports may contain sensitive organisational and identity information. Store them in an approved secure location and do not commit them to this repository.
 
 ## Recommended operational process
 
-1. Generate a fresh report.
-2. Validate identity correlation and synchronisation state.
-3. Confirm owner, employment, or contract status.
-4. Check group, role, licence, mailbox, data, application, and service dependencies.
-5. Review possible service identities separately.
-6. Review and expire exclusions.
-7. Obtain approved business, HR, security, and change-management decisions.
-8. Disable before deletion where policy permits.
-9. Record the disablement independently of `whenChanged`.
-10. Revalidate before deletion.
+1. Confirm the organisation's approved inactivity and retention thresholds.
+2. Confirm the authoritative system for each identity type.
+3. Generate a fresh report immediately before the planned review or remediation cycle.
+4. Verify that AD and Entra collection completed successfully.
+5. Review missing, conflicting, future-dated, or otherwise unexpected activity values.
+6. Maintain and review the exclusion list.
+7. Validate service, shared, mailbox, privileged, emergency-access, and application-linked accounts with their owners.
+8. Produce separate proposed disablement and deletion lists.
+9. Obtain the required technical, security, business-owner, change-management, and legal approvals.
+10. Test the process on a small approved sample.
+11. Retain the approved input, result, exception, and rollback evidence.
+12. Revalidate an identity immediately before any action is performed.
+
+Do not use an old report as an action list. Account activity, ownership, employment status, mailbox use, exclusions, and business dependencies can change after a report is generated.
 
 ## Password-reset considerations
 
-Password reset is intentionally outside this report-only framework.
+Password age is reported as supporting evidence. It is not used to prove inactivity.
 
-For synchronised users, use the organisation's supported process at the authoritative identity source. Cloud-only password management requires a separate workflow and appropriate write permissions.
+A password reset is a separate remediation action and must not be added to this reporting script. Any password-reset process should:
 
-Never bulk-reset service-account candidates without dependency analysis, owner approval, testing, rollback planning, and a controlled change window.
+- Use a separately approved input list
+- Respect the authoritative identity source
+- Avoid exposing temporary passwords in reports, logs, consoles, transcripts, or source control
+- Require a password change at next sign-in where appropriate
+- Follow privileged-account and emergency-access procedures
+- Apply session revocation only where separately assessed and approved
+- Record success or failure without recording plaintext passwords
+- Follow applicable support, security, privacy, audit, and change-management policy
+
+For synchronised users, confirm whether the password is authoritative in on-premises AD and how password hash synchronisation or password writeback applies before taking action.
 
 ## Known limitations
 
-- The framework has not been integration-tested against a live forest and tenant.
-- UPN matching is practical but not authoritative identity correlation.
-- `lastLogonTimestamp` is approximate.
-- `lastSuccessfulSignInDateTime` has licensing, role, permission, and historical-data limitations.
-- `whenChanged` is non-replicated and is not a disablement timestamp.
-- Cross-DC validation is conservative but does not identify the originating change.
-- DC availability affects validation.
-- Service-account detection for normal user objects is heuristic.
-- `adminCount` is an indicator, not a complete current privilege assessment.
-- Reports contain sensitive identity information and must be protected.
-- The script is report-only by design.
+- `lastLogonTimestamp` is replicated but is not a real-time or exact last-logon value.
+- `lastLogonTimestamp` can be affected by directory update behavior, authentication patterns, and abnormal domain-controller time conditions.
+- A recent `whenChanged` value proves that the AD object was modified, not that the user authenticated or that the modification represents the account's disablement date.
+- `whenChanged` is non-replicated, so the script queries all writable DCs only for provisional disabled stale candidates.
+- Microsoft Entra sign-in activity may be unavailable because of licensing, permissions, retention, historical availability, or collection failure.
+- UPN matching does not prove that two objects represent the same synchronised identity.
+- Users can have different UPNs between AD and Entra.
+- Cloud-only and unmatched guest users are outside the Active Directory-led inventory.
+- Service-account detection is indicative and requires owner validation.
+- Shared, resource, and inactive mailboxes may require separate Exchange validation.
+- Password age does not prove inactivity.
+- `whenCreated` does not prove that an identity was ever successfully used.
+- A failed writable-DC query prevents confirmation of a disabled stale candidate but does not prove that the account is active.
+- The script does not validate replication health, domain-controller time health, human-resources status, application ownership, legal hold, mailbox state, licensing requirements, or business dependency.
+- CSV output can contain sensitive identity information and must be protected appropriately.
 
 ## Public Microsoft references
 
-### Microsoft Entra and Graph
-
-- [Manage inactive user accounts](https://learn.microsoft.com/en-us/entra/identity/monitoring-health/howto-manage-inactive-user-accounts)
-- [signInActivity resource](https://learn.microsoft.com/en-us/graph/api/resources/signinactivity?view=graph-rest-1.0)
-- [Microsoft Graph PowerShell overview](https://learn.microsoft.com/en-us/powershell/microsoftgraph/overview)
-- [Get-MgUser](https://learn.microsoft.com/en-us/powershell/module/microsoft.graph.users/get-mguser)
-
-### Active Directory attributes and identifiers
-
-- [lastLogonTimestamp](https://learn.microsoft.com/en-us/windows/win32/adschema/a-lastlogontimestamp)
-- [lastLogon](https://learn.microsoft.com/en-us/windows/win32/adschema/a-lastlogon)
-- [pwdLastSet](https://learn.microsoft.com/en-us/windows/win32/adschema/a-pwdlastset)
-- [whenChanged](https://learn.microsoft.com/en-us/windows/win32/adschema/a-whenchanged)
+- [lastLogonTimestamp attribute](https://learn.microsoft.com/en-us/windows/win32/adschema/a-lastlogontimestamp)
+- [whenChanged attribute](https://learn.microsoft.com/en-us/windows/win32/adschema/a-whenchanged)
 - [Open Specifications for whenChanged](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-adls/ac3586ae-bf24-42f2-ad23-22bdfaf75b62)
-- [Predefined RIDs](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-samr/565a6584-3061-4ede-a531-f5c53826504b)
+- [pwdLastSet attribute](https://learn.microsoft.com/en-us/windows/win32/adschema/a-pwdlastset)
+- [Microsoft Graph signInActivity resource](https://learn.microsoft.com/en-us/graph/api/resources/signinactivity?view=graph-rest-1.0)
+- [Microsoft Graph user resource](https://learn.microsoft.com/en-us/graph/api/resources/user?view=graph-rest-1.0)
+- [Get-MgUser PowerShell documentation](https://learn.microsoft.com/en-us/powershell/module/microsoft.graph.users/get-mguser)
+- [Get-ADUser PowerShell documentation](https://learn.microsoft.com/en-us/powershell/module/activedirectory/get-aduser)
+- [Get-ADForest PowerShell documentation](https://learn.microsoft.com/en-us/powershell/module/activedirectory/get-adforest)
+- [Get-ADDomainController PowerShell documentation](https://learn.microsoft.com/en-us/powershell/module/activedirectory/get-addomaincontroller)
+- [Microsoft predefined RID values](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-samr/565a6584-3061-4ede-a531-f5c53826504b)
 
-### Active Directory PowerShell
-
-- [Active Directory module](https://learn.microsoft.com/en-us/powershell/module/activedirectory/?view=windowsserver2025-ps)
-- [Get-ADUser](https://learn.microsoft.com/en-us/powershell/module/activedirectory/get-aduser?view=windowsserver2025-ps)
-- [Get-ADForest](https://learn.microsoft.com/en-us/powershell/module/activedirectory/get-adforest?view=windowsserver2025-ps)
-- [Get-ADDomainController](https://learn.microsoft.com/en-us/powershell/module/activedirectory/get-addomaincontroller?view=windowsserver2025-ps)
-- [Get-ADServiceAccount](https://learn.microsoft.com/en-us/powershell/module/activedirectory/get-adserviceaccount?view=windowsserver2025-ps)
+Validate all references and implementation details against current Microsoft documentation before using the framework in an organisational environment.
 
 ## Repository structure
 
 ```text
 Hybrid-Stale-User-Management/
-├── README.md
-├── LICENSE
-├── SECURITY.md
-├── .gitignore
-├── scripts/
-│   └── Get-HybridStaleUserReport.ps1
-└── examples/
-    └── UserExclusions.example.csv
+|-- examples/
+|   `-- UserExclusions.csv
+|-- scripts/
+|   `-- Get-HybridStaleUserReport.ps1
+|-- .gitignore
+|-- LICENSE
+|-- README.md
+`-- SECURITY.md
 ```
+
+Generated output should be stored outside the repository or in an ignored local output directory.
+
+Recommended `.gitignore` entries include:
+
+```gitignore
+output/*
+*.csv
+*.xlsx
+*.log
+*.clixml
+```
+
+If example CSV files are retained in the repository, add explicit negation rules for the sanitised examples after the broader CSV exclusion.
 
 ## Contributing
 
-Contributions that improve safety, performance, error handling, testing, or documentation are welcome.
+Contributions are welcome when they preserve the report-first and safety-focused design.
 
-Before submitting a pull request:
+Before submitting a change:
 
-1. Remove all organisational information.
-2. Use fictional identifiers.
-3. Do not include generated reports or secrets.
-4. State the PowerShell and module versions tested.
-5. Describe the test approach without identifying an organisation.
-6. Confirm whether the change remains report-only.
-7. Update documentation for behavior changes.
+1. Remove all customer and organisational information.
+2. Do not include real account identifiers or report output.
+3. Keep the reporting and remediation stages separate.
+4. Use least-privileged read permissions where possible.
+5. Preserve conservative handling of missing information.
+6. Validate PowerShell syntax.
+7. Test in an isolated non-production environment.
+8. Update this README when behavior, parameters, prerequisites, or output changes.
 
 ## Security
 
-Do not disclose organisational data through a public issue. Review [SECURITY.md](SECURITY.md) before reporting a concern.
+Do not open a public issue containing credentials, tokens, tenant information, user data, internal server names, security findings, or production report output.
+
+Follow the process in [SECURITY.md](SECURITY.md) when reporting a potential security concern.
+
+This repository is not a secure location for production configuration, exclusions, transcripts, reports, credentials, or investigation evidence.
 
 ## Licence
 
 This project is licensed under the terms in [LICENSE](LICENSE).
 
+The licence does not make the script supported, warranted, approved for production, or suitable for a particular environment. Users remain responsible for review, testing, authorisation, operation, data protection, and compliance.
+
 ## Final thoughts
 
-The most dangerous stale-account script is not always the one that fails.
+Stale account management is not only a scripting problem. It is an identity-governance process involving technical evidence, business ownership, exclusions, approval, retention, rollback, and auditability.
 
-It is often the one that completes successfully, produces a polished report, and confidently classifies the wrong accounts.
-
-A defensible process must explain:
-
-- Why the identity received its classification
-- Which evidence was used
-- Which evidence was missing
-- Why exclusions applied or did not apply
-- Who validated the account
-- Who approved the action
-- How the account can be recovered if the decision was wrong
-
-The code is important. The governance process around it is what makes the outcome defensible.
+The safest outcome is not the largest number of disabled accounts. It is a defensible process that reduces identity risk without disrupting legitimate users or services.
