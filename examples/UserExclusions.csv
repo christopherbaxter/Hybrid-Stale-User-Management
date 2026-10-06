@@ -1,0 +1,4 @@
+SamAccountName,Reason
+svc-example,Application service account
+breakglass-admin,Emergency access account
+shared-operations,Approved shared operational account
